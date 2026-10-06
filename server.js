@@ -1,432 +1,392 @@
-const http = require("http");
-const { WebSocketServer } = require("ws");
+'use strict';
+/*
+ * Server agar.io minimale: serve i file statici in ./public e gestisce
+ * il WebSocket (stesso host/porta) con il protocollo che il client si aspetta.
+ * Avvio: npm install && npm start   (Railway usa la variabile PORT)
+ */
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { WebSocketServer } = require('ws');
 
-const PORT = Number(process.env.PORT || 3322);
-const WIDTH = 12000;
-const HEIGHT = 12000;
-const HALF_W = WIDTH / 2;
-const HALF_H = HEIGHT / 2;
-const TICK_MS = 50;
+const PORT = process.env.PORT || 8080;
+const PUBLIC = path.join(__dirname, 'public');
 
-let nextId = 1;
-const clients = new Set();
-const cells = new Map();
-
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-const rand = (a, b) => a + Math.random() * (b - a);
-const dist2 = (a, b) => {
-  const dx = a.x - b.x, dy = a.y - b.y;
-  return dx * dx + dy * dy;
+const CFG = {
+  border: 14000,        // mappa quadrata 0..border (il client usa int16: max 32767)
+  tickMs: 40,           // 25 tick/s
+  foodMax: 700, foodSize: 10,
+  virusMax: 12, virusSize: 100,
+  startSize: 32, minSplitSize: 60, maxCells: 16,
+  ejectSize: 36, ejectCostArea: 1600, minEjectSize: 57,
+  maxSize: 1500,
+  mergeBaseTicks: 375,  // ~15 s
+  viewHalfW: 1100, viewHalfH: 700,
+  maxPlayers: 60,
 };
 
-function randomColor() {
-  return [
-    Math.floor(rand(50, 240)),
-    Math.floor(rand(50, 240)),
-    Math.floor(rand(50, 240))
-  ];
-}
+// ---------------------------------------------------------------- mondo
+let nextId = 1, tickCount = 0, foodCount = 0, virusCount = 0;
+const cells = new Map();     // id -> cella
+const players = new Set();
+let eatEvents = [];          // [{k, v}] del tick corrente
 
-function str16(value = "") {
-  const s = String(value).slice(0, 32);
-  const b = Buffer.alloc(2 * (s.length + 1));
-  for (let i = 0; i < s.length; i++) b.writeUInt16LE(s.charCodeAt(i), i * 2);
-  return b;
-}
+const rnd = (a, b) => a + Math.random() * (b - a);
+const randColor = () => {
+  const h = Math.random() * 6, x = Math.floor(255 * (1 - Math.abs((h % 2) - 1)));
+  const [r, g, b] = [[255, x, 0], [x, 255, 0], [0, 255, x], [0, x, 255], [x, 0, 255], [255, 0, x]][Math.floor(h) % 6];
+  return [r, g, b];
+};
 
-function parseString(buf, start) {
-  let s = "";
-  for (let p = start; p + 1 < buf.length; p += 2) {
-    const ch = buf.readUInt16LE(p);
-    if (!ch) return [s, p + 2];
-    s += String.fromCharCode(ch);
+function addCell(type, x, y, size, color, owner) {
+  const c = { id: nextId++, type, x, y, size, color, owner: owner || null,
+              bx: 0, by: 0, bs: 0, born: tickCount, mergeAt: 0, feeds: 0, dead: false };
+  if (nextId > 0xfffffff0) nextId = 1;
+  cells.set(c.id, c);
+  if (type === 'food') foodCount++;
+  if (type === 'virus') virusCount++;
+  return c;
+}
+function removeCell(c) {
+  if (c.dead) return;
+  c.dead = true;
+  cells.delete(c.id);
+  if (c.type === 'food') foodCount--;
+  if (c.type === 'virus') virusCount--;
+  if (c.type === 'player' && c.owner) {
+    const i = c.owner.cells.indexOf(c);
+    if (i >= 0) c.owner.cells.splice(i, 1);
   }
-  return [s, buf.length];
+}
+const mergeDelay = (size) => CFG.mergeBaseTicks + Math.floor(size * size / 100 * 0.5);
+
+function newPlayerCell(p, x, y, size) {
+  const c = addCell('player', x, y, size, p.color, p);
+  c.mergeAt = tickCount + mergeDelay(size);
+  p.cells.push(c);
+  send32(p, c.id);
+  return c;
 }
 
-function send(ws, buf) {
-  if (ws && ws.readyState === 1) ws.send(buf);
+// ---------------------------------------------------------------- binario
+const strBytes = (s) => (s.length + 1) * 2;
+function putStr(buf, off, s) {
+  for (let i = 0; i < s.length; i++) buf.writeUInt16LE(s.charCodeAt(i), off + 2 * i);
+  buf.writeUInt16LE(0, off + 2 * s.length);
+  return off + strBytes(s);
 }
-
-function broadcast(buf) {
-  for (const c of clients) send(c.ws, buf);
+function sendRaw(p, buf) {
+  if (p.ws.readyState === 1) p.ws.send(buf, { binary: true });
 }
-
-function pktBorder() {
+function sendBorder(p) {
   const b = Buffer.alloc(33);
   b[0] = 64;
-  b.writeDoubleLE(-HALF_W, 1);
-  b.writeDoubleLE(-HALF_H, 9);
-  b.writeDoubleLE(HALF_W, 17);
-  b.writeDoubleLE(HALF_H, 25);
-  return b;
+  b.writeDoubleLE(0, 1); b.writeDoubleLE(0, 9);
+  b.writeDoubleLE(CFG.border, 17); b.writeDoubleLE(CFG.border, 25);
+  sendRaw(p, b);
+}
+function send32(p, id) {
+  const b = Buffer.alloc(5); b[0] = 32; b.writeUInt32LE(id, 1); sendRaw(p, b);
+}
+function sendChatMsg(p, name, color, text) {
+  const b = Buffer.alloc(5 + strBytes(name) + strBytes(text));
+  b[0] = 99; b[1] = 0; b[2] = color[0]; b[3] = color[1]; b[4] = color[2];
+  let o = putStr(b, 5, name); putStr(b, o, text);
+  sendRaw(p, b);
 }
 
-function pktAdd(id) {
-  const b = Buffer.alloc(5);
-  b[0] = 32;
-  b.writeUInt32LE(id >>> 0, 1);
-  return b;
+// ---------------------------------------------------------------- azioni
+function totalArea(p) { return p.cells.reduce((s, c) => s + c.size * c.size, 0); }
+
+function spawnPlayer(p, name) {
+  if (p.cells.length) return;
+  p.name = name; p.alive = true; p.spectate = false;
+  const x = rnd(500, CFG.border - 500), y = rnd(500, CFG.border - 500);
+  p.mouseX = x; p.mouseY = y;
+  newPlayerCell(p, x, y, CFG.startSize);
 }
 
-function pktClear() {
-  return Buffer.from([20]);
-}
-
-function pktPos(cell) {
-  const b = Buffer.alloc(13);
-  b[0] = 17;
-  b.writeFloatLE(cell?.x || 0, 1);
-  b.writeFloatLE(cell?.y || 0, 5);
-  b.writeFloatLE(cell?.size || 1, 9);
-  return b;
-}
-
-function pktLeaderboard() {
-  const list = [...clients]
-    .filter(c => c.alive)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 10);
-
-  const parts = [Buffer.from([49]), Buffer.alloc(4)];
-  parts[1].writeUInt32LE(list.length, 0);
-
-  for (const c of list) {
-    const id = Buffer.alloc(4);
-    id.writeUInt32LE((c.primaryCellId || 0) >>> 0, 0);
-    parts.push(id, str16(c.name || "UnnamedCell"));
+function split(p) {
+  const n0 = p.cells.length;
+  for (let i = 0; i < n0; i++) {
+    if (p.cells.length >= CFG.maxCells) break;
+    const c = p.cells[i];
+    if (!c || c.size < CFG.minSplitSize) continue;
+    let dx = p.mouseX - c.x, dy = p.mouseY - c.y;
+    const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
+    const s = Math.sqrt(c.size * c.size / 2);
+    c.size = s; c.mergeAt = tickCount + mergeDelay(s);
+    const nc = newPlayerCell(p, c.x, c.y, s);
+    nc.bx = dx; nc.by = dy; nc.bs = 40;
   }
-  return Buffer.concat(parts);
 }
 
-function pktUpdate() {
-  const parts = [Buffer.from([16]), Buffer.alloc(2)];
-  parts[1].writeUInt16LE(0, 0);
+function eject(p) {
+  for (const c of p.cells.slice()) {
+    if (c.size < CFG.minEjectSize) continue;
+    let dx = p.mouseX - c.x, dy = p.mouseY - c.y;
+    const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
+    c.size = Math.sqrt(Math.max(1, c.size * c.size - CFG.ejectCostArea));
+    const e = addCell('eject', c.x + dx * c.size, c.y + dy * c.size, CFG.ejectSize, c.color, p);
+    e.bx = dx; e.by = dy; e.bs = 36;
+  }
+}
 
-  for (const cell of cells.values()) {
-    const name = str16(cell.name || "");
-    const h = Buffer.alloc(14);
-    h.writeUInt32LE(cell.id >>> 0, 0);
-    h.writeInt16LE(Math.round(cell.x), 4);
-    h.writeInt16LE(Math.round(cell.y), 6);
-    h.writeInt16LE(Math.round(cell.size), 8);
-    h[10] = cell.color[0];
-    h[11] = cell.color[1];
-    h[12] = cell.color[2];
-    h[13] = cell.virus ? 1 : 0;
-    parts.push(h, name);
+function popCell(p, c, virus) {
+  removeCell(virus);
+  const total = Math.min(c.size * c.size + virus.size * virus.size, CFG.maxSize * CFG.maxSize);
+  const extra = Math.min(CFG.maxCells - p.cells.length, 7);
+  if (extra <= 0) { c.size = Math.sqrt(total); return; }
+  const ps = Math.sqrt(total / (extra + 1));
+  c.size = ps; c.mergeAt = tickCount + mergeDelay(ps);
+  const a0 = Math.random() * Math.PI * 2;
+  for (let i = 0; i < extra; i++) {
+    const a = a0 + i * (Math.PI * 2 / extra);
+    const nc = newPlayerCell(p, c.x, c.y, ps);
+    nc.bx = Math.cos(a); nc.by = Math.sin(a); nc.bs = 36;
+  }
+}
+
+function eatCell(eater, prey) {
+  eater.size = Math.min(CFG.maxSize, Math.sqrt(eater.size * eater.size + prey.size * prey.size));
+  eatEvents.push({ k: eater.id, v: prey.id });
+  const owner = prey.type === 'player' ? prey.owner : null;
+  removeCell(prey);
+  if (owner && !owner.cells.length) owner.alive = false;
+}
+
+// ---------------------------------------------------------------- tick
+function tick() {
+  tickCount++;
+  eatEvents = [];
+  const B = CFG.border;
+
+  // movimento
+  for (const c of cells.values()) {
+    if (c.type === 'player') {
+      const p = c.owner;
+      const dx = p.mouseX - c.x, dy = p.mouseY - c.y;
+      const d = Math.hypot(dx, dy);
+      if (d > 1) {
+        const sp = Math.min(d, 88 * Math.pow(c.size, -0.439));
+        c.x += dx / d * sp; c.y += dy / d * sp;
+      }
+    }
+    if (c.bs > 0.5) {
+      c.x += c.bx * c.bs; c.y += c.by * c.bs;
+      c.bs *= (c.type === 'eject' ? 0.88 : 0.9);
+    } else c.bs = 0;
+    const r = c.size / 2;
+    c.x = Math.max(r, Math.min(B - r, c.x));
+    c.y = Math.max(r, Math.min(B - r, c.y));
   }
 
-  const terminator = Buffer.alloc(4);
-  parts.push(terminator);
-  return Buffer.concat(parts);
+  // celle dello stesso giocatore: separazione / fusione
+  for (const p of players) {
+    const cs = p.cells;
+    for (let i = 0; i < cs.length; i++) {
+      for (let j = i + 1; j < cs.length; j++) {
+        const a = cs[i], b = cs[j];
+        if (!a || !b || a.dead || b.dead) continue;
+        const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 0.001;
+        if (tickCount >= a.mergeAt && tickCount >= b.mergeAt) {
+          const big = a.size >= b.size ? a : b, small = big === a ? b : a;
+          if (d < big.size) { eatCell(big, small); j = i; }
+        } else {
+          const ov = a.size + b.size - d;
+          if (ov > 0) {
+            const ma = a.size * a.size, mb = b.size * b.size, t = ma + mb;
+            const ux = dx / d, uy = dy / d;
+            a.x -= ux * ov * mb / t; a.y -= uy * ov * mb / t;
+            b.x += ux * ov * ma / t; b.y += uy * ov * ma / t;
+          }
+        }
+      }
+    }
+  }
+
+  // mangiare
+  for (const p of players) {
+    for (const c of p.cells.slice()) {
+      if (c.dead) continue;
+      for (const o of cells.values()) {
+        if (o === c || o.dead || c.dead) continue;
+        if (o.type === 'player' && o.owner === p) continue;
+        if (o.type === 'eject' && o.owner === p && tickCount - o.born < 12) continue;
+        const dx = o.x - c.x, dy = o.y - c.y;
+        if (Math.abs(dx) > c.size || Math.abs(dy) > c.size) continue;
+        const d = Math.hypot(dx, dy);
+        if (o.type === 'food' || o.type === 'eject') {
+          if (c.size > o.size * 1.1 && d < c.size) eatCell(c, o);
+        } else if (o.type === 'player') {
+          if (c.size > o.size * 1.15 && d < c.size - o.size * 0.4) eatCell(c, o);
+        } else if (o.type === 'virus') {
+          if (c.size > o.size * 1.15 && d < c.size - o.size * 0.4) popCell(p, c, o);
+        }
+      }
+    }
+  }
+
+  // eject contro virus
+  for (const v of Array.from(cells.values())) {
+    if (v.type !== 'virus' || v.dead) continue;
+    for (const e of cells.values()) {
+      if (e.type !== 'eject' || e.dead) continue;
+      if (Math.hypot(e.x - v.x, e.y - v.y) < v.size) {
+        v.size = Math.sqrt(v.size * v.size + e.size * e.size);
+        v.feeds++;
+        if (v.feeds >= 7 && virusCount < CFG.virusMax + 6) {
+          v.feeds = 0; v.size = CFG.virusSize;
+          const nv = addCell('virus', v.x, v.y, CFG.virusSize, [51, 255, 51]);
+          nv.bx = e.bx || 1; nv.by = e.by || 0; nv.bs = 40;
+        }
+        removeCell(e);
+      }
+    }
+  }
+
+  // decadimento massa (1 volta al secondo)
+  if (tickCount % 25 === 0) {
+    for (const p of players) for (const c of p.cells) if (c.size > 35) c.size *= 0.999;
+  }
+
+  // ripopolamento
+  for (let i = 0; i < 6 && foodCount < CFG.foodMax; i++)
+    addCell('food', rnd(20, CFG.border - 20), rnd(20, CFG.border - 20), CFG.foodSize, randColor());
+  if (virusCount < CFG.virusMax && tickCount % 50 === 0)
+    addCell('virus', rnd(300, CFG.border - 300), rnd(300, CFG.border - 300), CFG.virusSize, [51, 255, 51]);
+
+  // classifica
+  let lbBuf = null;
+  if (tickCount % 25 === 0) {
+    const top = Array.from(players).filter(p => p.cells.length)
+      .map(p => ({ p, a: totalArea(p) })).sort((a, b) => b.a - a.a).slice(0, 10);
+    let size = 5; for (const t of top) size += 4 + strBytes(t.p.name);
+    lbBuf = Buffer.alloc(size); lbBuf[0] = 49; lbBuf.writeUInt32LE(top.length, 1);
+    let o = 5;
+    for (const t of top) { lbBuf.writeUInt32LE(t.p.cells[0].id, o); o = putStr(lbBuf, o + 4, t.p.name); }
+  }
+
+  // aggiornamenti ai client
+  let leader = null;
+  for (const p of players) if (p.cells.length && (!leader || totalArea(p) > totalArea(leader))) leader = p;
+  for (const p of players) {
+    if (p.ws.readyState !== 1) continue;
+    let cx = CFG.border / 2, cy = CFG.border / 2, total = 64;
+    const ref = p.cells.length ? p : (p.spectate ? leader : null);
+    if (ref) {
+      cx = ref.cells.reduce((s, c) => s + c.x, 0) / ref.cells.length;
+      cy = ref.cells.reduce((s, c) => s + c.y, 0) / ref.cells.length;
+      total = ref.cells.reduce((s, c) => s + c.size, 0);
+    }
+    const scale = Math.pow(Math.min(64 / total, 1), 0.4);
+    const hw = CFG.viewHalfW / scale, hh = CFG.viewHalfH / scale;
+    if (!p.cells.length && p.spectate && ref) {
+      const cam = Buffer.alloc(13); cam[0] = 17;
+      cam.writeFloatLE(cx, 1); cam.writeFloatLE(cy, 5); cam.writeFloatLE(scale, 9);
+      sendRaw(p, cam);
+    }
+    const vis = [];
+    for (const c of cells.values()) {
+      if (Math.abs(c.x - cx) < hw + c.size && Math.abs(c.y - cy) < hh + c.size) vis.push(c);
+    }
+    const now = new Set(vis.map(c => c.id));
+    const evs = eatEvents.filter(e => p.visible.has(e.v));
+    const removed = [];
+    for (const id of p.visible) if (!now.has(id)) removed.push(id);
+    for (const e of evs) if (!removed.includes(e.v)) removed.push(e.v);
+
+    let size = 3 + evs.length * 8 + 4 + 4 + removed.length * 4;
+    for (const c of vis) size += 14 + strBytes(c.type === 'player' ? c.owner.name : '');
+    const b = Buffer.alloc(size);
+    let o = 0;
+    b[o++] = 16; b.writeUInt16LE(evs.length, o); o += 2;
+    for (const e of evs) { b.writeUInt32LE(e.k, o); b.writeUInt32LE(e.v, o + 4); o += 8; }
+    for (const c of vis) {
+      b.writeUInt32LE(c.id, o); o += 4;
+      b.writeInt16LE(Math.round(c.x), o); b.writeInt16LE(Math.round(c.y), o + 2);
+      b.writeInt16LE(Math.round(c.size), o + 4); o += 6;
+      b[o++] = c.color[0]; b[o++] = c.color[1]; b[o++] = c.color[2];
+      b[o++] = c.type === 'virus' ? 1 : 0;
+      o = putStr(b, o, c.type === 'player' ? c.owner.name : '');
+    }
+    b.writeUInt32LE(0, o); o += 4;
+    b.writeUInt32LE(removed.length, o); o += 4;
+    for (const id of removed) { b.writeUInt32LE(id, o); o += 4; }
+    sendRaw(p, b);
+    p.visible = now;
+    if (lbBuf) sendRaw(p, lbBuf);
+  }
 }
 
-function spawnFood(count = 220) {
-  for (let i = 0; i < count; i++) {
-    const id = nextId++;
-    cells.set(id, {
-      id,
-      x: rand(-5800, 5800),
-      y: rand(-5800, 5800),
-      size: 8 + Math.floor(Math.random() * 8),
-      color: randomColor(),
-      name: "",
-      clientId: null,
-      virus: false,
-      food: true
+// ---------------------------------------------------------------- rete
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg', '.webp': 'image/webp',
+  '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.json': 'application/json', '.gif': 'image/gif',
+  '.woff2': 'font/woff2', '.woff': 'font/woff', '.txt': 'text/plain; charset=utf-8' };
+
+const server = http.createServer((req, res) => {
+  let url = decodeURIComponent((req.url || '/').split('?')[0]);
+  if (url === '/health') { res.writeHead(200); return res.end('ok'); }
+  if (url === '/' || url === '/index.html' || url === '/index.php') url = '/game.html';
+  const file = path.normalize(path.join(PUBLIC, url));
+  if (!file.startsWith(PUBLIC)) { res.writeHead(403); return res.end('Forbidden'); }
+  fs.stat(file, (err, st) => {
+    if (err || !st.isFile()) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('Not found'); }
+    const ext = path.extname(file).toLowerCase();
+    res.writeHead(200, {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600',
     });
-  }
-}
-
-function createPlayerCell(client, size = 45, x, y) {
-  const id = nextId++;
-  const cell = {
-    id,
-    x: x ?? rand(-5000, 5000),
-    y: y ?? rand(-5000, 5000),
-    size,
-    color: client.color.slice(),
-    name: client.name || "UnnamedCell",
-    clientId: client.id,
-    virus: false,
-    food: false
-  };
-  cells.set(id, cell);
-  client.cells.add(id);
-  client.primaryCellId ||= id;
-  client.alive = true;
-  return cell;
-}
-
-function playerCells(client) {
-  return [...client.cells]
-    .map(id => cells.get(id))
-    .filter(Boolean);
-}
-
-function recomputeScore(client) {
-  client.score = playerCells(client)
-    .reduce((sum, c) => sum + c.size * c.size / 100, 0);
-  client.alive = playerCells(client).length > 0;
-}
-
-function removePlayerCell(client, id) {
-  cells.delete(id);
-  client.cells.delete(id);
-  if (client.primaryCellId === id) {
-    client.primaryCellId = [...client.cells][0] || 0;
-  }
-  recomputeScore(client);
-}
-
-function split(client) {
-  const source = playerCells(client)
-    .filter(c => c.size >= 35)
-    .sort((a, b) => b.size - a.size)[0];
-
-  if (!source || client.cells.size >= 16) return;
-
-  const angle = Math.random() * Math.PI * 2;
-  const oldSize = source.size;
-  const newSize = oldSize * 0.71;
-  source.size = newSize;
-
-  const speedOffset = Math.max(80, 2200 / (newSize + 100));
-  const cell = createPlayerCell(
-    client,
-    newSize,
-    clamp(source.x + Math.cos(angle) * newSize * 2, -5900, 5900),
-    clamp(source.y + Math.sin(angle) * newSize * 2, -5900, 5900)
-  );
-
-  cell.x += Math.cos(angle) * speedOffset * 0.15;
-  cell.y += Math.sin(angle) * speedOffset * 0.15;
-  recomputeScore(client);
-}
-
-function eject(client) {
-  const source = playerCells(client)
-    .filter(c => c.size >= 30)
-    .sort((a, b) => b.size - a.size)[0];
-
-  if (!source) return;
-
-  source.size -= 2;
-  const angle = Math.random() * Math.PI * 2;
-  const id = nextId++;
-
-  cells.set(id, {
-    id,
-    x: clamp(source.x + Math.cos(angle) * (source.size + 18), -5900, 5900),
-    y: clamp(source.y + Math.sin(angle) * (source.size + 18), -5900, 5900),
-    size: 12,
-    color: source.color.slice(),
-    name: "",
-    clientId: null,
-    virus: false,
-    food: true,
-    ejected: true
+    fs.createReadStream(file).pipe(res);
   });
-}
-
-function spectate(client) {
-  const other = [...clients].find(c => c !== client && c.alive);
-  if (!other) return;
-  const target = playerCells(other)[0];
-  if (target) {
-    client.spectating = true;
-    client.spectateId = target.id;
-  }
-}
-
-function handleChat(client, data) {
-  const flags = data[1] || 0;
-  const [name, p] = parseString(data, 2);
-  const [message] = parseString(data, p);
-  const clean = String(message || "").slice(0, 500);
-  if (!clean) return;
-
-  const payload = Buffer.concat([
-    Buffer.from([99, flags & 1, name ? 1 : 0]),
-    str16(client.name || name || "UnnamedCell"),
-    str16(clean)
-  ]);
-  broadcast(payload);
-}
-
-function handle(client, data) {
-  if (!Buffer.isBuffer(data) || !data.length) return;
-  const op = data[0];
-
-  if (op === 16 && data.length >= 17) {
-    client.targetX = data.readDoubleLE(1);
-    client.targetY = data.readDoubleLE(9);
-    client.spectating = false;
-  } else if (op === 192) {
-    const [name] = parseString(data, 1);
-    client.name = String(name || "UnnamedCell").slice(0, 32);
-    for (const cell of playerCells(client)) cell.name = client.name;
-  } else if (op === 17) {
-    split(client);
-  } else if (op === 21) {
-    eject(client);
-  } else if (op === 1) {
-    spectate(client);
-  } else if (op === 206) {
-    handleChat(client, data);
-  }
-}
-
-function updateMovement() {
-  for (const client of clients) {
-    if (client.spectating && client.spectateId) {
-      const target = cells.get(client.spectateId);
-      if (target) {
-        client.targetX = target.x;
-        client.targetY = target.y;
-      }
-    }
-
-    for (const cell of playerCells(client)) {
-      const dx = client.targetX - cell.x;
-      const dy = client.targetY - cell.y;
-      const len = Math.hypot(dx, dy);
-      const speed = Math.max(1.5, 1800 / (cell.size + 100));
-
-      if (len > 2) {
-        cell.x = clamp(cell.x + dx / len * speed, -5900, 5900);
-        cell.y = clamp(cell.y + dy / len * speed, -5900, 5900);
-      }
-      cell.name = client.name || "UnnamedCell";
-    }
-  }
-}
-
-function updateEating() {
-  const all = [...cells.values()];
-  const foods = all.filter(c => c.food && !c.ejected);
-  const ejected = all.filter(c => c.ejected);
-  const players = all.filter(c => c.clientId !== null && !c.food);
-
-  for (const player of players) {
-    for (const food of foods) {
-      if (!cells.has(food.id)) continue;
-      const reach = player.size + food.size;
-      if (dist2(player, food) < reach * reach) {
-        player.size += 0.35;
-        cells.delete(food.id);
-      }
-    }
-
-    for (const pellet of ejected) {
-      if (!cells.has(pellet.id)) continue;
-      const reach = player.size + pellet.size;
-      if (dist2(player, pellet) < reach * reach && pellet.clientId !== player.clientId) {
-        player.size += 0.5;
-        cells.delete(pellet.id);
-      }
-    }
-  }
-
-  // Simple PvP eating: only clearly larger cells can consume smaller ones.
-  for (const eater of players) {
-    for (const victim of players) {
-      if (eater.id === victim.id || eater.clientId === victim.clientId) continue;
-      if (eater.size < victim.size * 1.15) continue;
-
-      const reach = Math.max(eater.size * 0.75, 30);
-      if (dist2(eater, victim) < reach * reach) {
-        eater.size = Math.sqrt(eater.size * eater.size + victim.size * victim.size * 0.75);
-        const victimClient = [...clients].find(c => c.id === victim.clientId);
-        if (victimClient) removePlayerCell(victimClient, victim.id);
-      }
-    }
-  }
-}
-
-spawnFood();
-
-const httpServer = http.createServer((req, res) => {
-  if (req.url === "/health") {
-    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-    return res.end(JSON.stringify({
-      ok: true,
-      service: "ZeroLegend Agar WebSocket",
-      players: clients.size,
-      cells: cells.size,
-      port: PORT
-    }));
-  }
-
-  res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-  res.end("ZeroLegend Agar server online");
 });
 
-const wss = new WebSocketServer({
-  server: httpServer,
-  perMessageDeflate: false,
-  maxPayload: 64 * 1024
-});
+const wss = new WebSocketServer({ server, maxPayload: 2048 });
+wss.on('connection', (ws) => {
+  if (players.size >= CFG.maxPlayers) return ws.close();
+  const p = { ws, cells: [], name: '', color: randColor(), mouseX: 0, mouseY: 0, alive: false,
+              spectate: false, visible: new Set(), lastChat: 0 };
+  players.add(p);
+  sendBorder(p);
 
-wss.on("connection", (ws) => {
-  const client = {
-    ws,
-    id: Math.random().toString(36).slice(2),
-    name: "UnnamedCell",
-    color: randomColor(),
-    cells: new Set(),
-    primaryCellId: 0,
-    alive: false,
-    score: 0,
-    targetX: 0,
-    targetY: 0,
-    spectating: false,
-    spectateId: 0
-  };
-
-  clients.add(client);
-  ws.binaryType = "arraybuffer";
-
-  send(ws, pktBorder());
-
-  const cell = createPlayerCell(client);
-  send(ws, pktAdd(cell.id));
-  send(ws, pktLeaderboard());
-
-  ws.on("message", data => {
-    try {
-      handle(client, Buffer.from(data));
-    } catch (_) {}
+  ws.on('message', (data, isBinary) => {
+    if (!isBinary || !data.length) return;
+    const op = data[0];
+    switch (op) {
+      case 255: sendBorder(p); break;
+      case 192: {                       // nickname = spawn
+        let name = data.toString('utf16le', 1).replace(/[\u0000-\u001f]/g, '').slice(0, 40);
+        spawnPlayer(p, name || '{1}Player');
+        break;
+      }
+      case 1: if (!p.cells.length) p.spectate = true; break;
+      case 16:
+        if (data.length >= 17) {
+          const x = data.readDoubleLE(1), y = data.readDoubleLE(9);
+          if (Number.isFinite(x) && Number.isFinite(y)) { p.mouseX = x; p.mouseY = y; }
+        }
+        break;
+      case 17: split(p); break;
+      case 21: eject(p); break;
+      case 206: {
+        const text = data.toString('utf16le', 2).replace(/[\u0000-\u001f]/g, '').slice(0, 100);
+        const now = Date.now();
+        if (!text || text === 'psx2psx2' || now - p.lastChat < 1000 || !p.name) break;
+        p.lastChat = now;
+        for (const q of players) sendChatMsg(q, p.name, p.color, text);
+        break;
+      }
+      default: break;                   // 254, 56, 18, 19, 65: ignorati
+    }
   });
-
-  ws.on("close", () => {
-    for (const id of [...client.cells]) cells.delete(id);
-    clients.delete(client);
+  ws.on('close', () => {
+    for (const c of p.cells.slice()) removeCell(c);
+    players.delete(p);
   });
-
-  ws.on("error", () => {});
+  ws.on('error', () => {});
 });
 
-setInterval(() => {
-  updateMovement();
-  updateEating();
-
-  if ([...cells.values()].filter(c => c.food).length < 160) spawnFood(80);
-
-  for (const client of clients) recomputeScore(client);
-
-  const update = pktUpdate();
-  const leaderboard = pktLeaderboard();
-
-  for (const client of clients) {
-    send(client.ws, update);
-    const primary = cells.get(client.primaryCellId);
-    if (primary) send(client.ws, pktPos(primary));
-    send(client.ws, leaderboard);
-  }
-}, TICK_MS);
-
-httpServer.listen(PORT, "0.0.0.0", () => {
-  console.log(`ZeroLegend Agar server listening on ${PORT}`);
-});
+setInterval(tick, CFG.tickMs);
+setInterval(() => console.log(`[stat] giocatori=${players.size} celle=${cells.size}`), 60000);
+server.listen(PORT, () => console.log(`Server su porta ${PORT}`));
