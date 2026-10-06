@@ -328,7 +328,10 @@ const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'application/javascri
 const server = http.createServer((req, res) => {
   let url = decodeURIComponent((req.url || '/').split('?')[0]);
   if (url === '/health') { res.writeHead(200); return res.end('ok'); }
-  if (url === '/' || url === '/index.html' || url === '/index.php') url = '/game.html';
+  const GAME = '/games/agar';
+  if (url === '/' || url === '/index.html' || url === '/index.php') { res.writeHead(302, { Location: GAME + '/' }); return res.end(); }
+  if (url === GAME) { res.writeHead(301, { Location: GAME + '/' }); return res.end(); }
+  if (url === GAME + '/' || url === GAME + '/index.html' || url === GAME + '/index.php') url = GAME + '/game.html';
   const file = path.normalize(path.join(PUBLIC, url));
   if (!file.startsWith(PUBLIC)) { res.writeHead(403); return res.end('Forbidden'); }
   fs.stat(file, (err, st) => {
